@@ -208,9 +208,11 @@ def _build_mhod_playlist_index() -> bytes:
 def _build_mhit(track: Track) -> bytes:
     """Build one mhit + its mhod children.
 
-    Only a handful of the ~60 integer fields matter for playback; the rest
-    are left at zero and the iPod fills them in from the audio file at
-    first play.
+    Field layout follows the documented ipodlinux "mhit v1" structure
+    (header length 0xf4). The important fields for playback are the id,
+    the visible flag, the filetype magic, and the location mhod child —
+    everything else is display metadata. We populate it anyway so the
+    iPod shows accurate duration/bitrate/etc. in its UI.
     """
     mhods = bytearray()
     mhods += _build_mhod_string(MHOD_TITLE, track.title or "Untitled")
@@ -224,47 +226,51 @@ def _build_mhit(track: Track) -> bytes:
     if track.composer:
         mhods += _build_mhod_string(MHOD_COMPOSER, track.composer)
 
-    # mhod children count. Required children are title + location; the
-    # others are added conditionally above.
     n_children = 2 + sum(bool(x) for x in (track.album, track.artist,
                                            track.genre, track.composer))
 
     total_len = MHIT_HDR + len(mhods)
     added_mac = track.date_added or unix_to_mac_time()
 
-    header = bytearray()
-    header += b"mhit"
-    header += struct.pack("<III", MHIT_HDR, total_len, n_children)
-    header += struct.pack("<I", track.track_id)              # 0x10 unique id
-    header += struct.pack("<I", 1)                            # 0x14 visible
-    header += _file_type_magic(track.file_ext)                # 0x18 file kind
-    header += struct.pack("<BBBB", 0, 1, 0, 0)                # 0x1c flags
-    header += struct.pack("<II", 0, 0)                        # 0x20 date added2, 0x24 ???
-    # mhit from here follows the field order documented on the ipodlinux wiki.
-    header += struct.pack("<I", track.file_size)              # 0x28 file size
-    header += struct.pack("<I", track.length_ms)              # 0x2c length ms
-    header += struct.pack("<I", track.track_number)           # 0x30
-    header += struct.pack("<I", track.track_count)            # 0x34
-    header += struct.pack("<I", track.year)                   # 0x38
-    header += struct.pack("<I", track.bitrate_kbps)           # 0x3c
-    header += struct.pack("<HH", 0, track.sample_rate_hz)     # 0x40 sample rate hi/lo
-    header += struct.pack("<I", 0)                            # 0x44 volume
-    header += struct.pack("<I", 0)                            # 0x48 start_time
-    header += struct.pack("<I", 0)                            # 0x4c stop_time
-    header += struct.pack("<I", 0)                            # 0x50 soundcheck
-    header += struct.pack("<I", track.play_count)             # 0x54 play count
-    header += struct.pack("<I", track.play_count)             # 0x58 play count2
-    header += struct.pack("<I", 0)                            # 0x5c last_played_time
-    header += struct.pack("<I", track.disc_number)            # 0x60
-    header += struct.pack("<I", track.disc_count)             # 0x64
-    header += struct.pack("<I", 0)                            # 0x68 user_id
-    header += struct.pack("<I", added_mac)                    # 0x6c date_added
-    header += struct.pack("<I", 0)                            # 0x70 bookmark
-    header += struct.pack("<II", track.dbid & 0xFFFFFFFF,
-                          (track.dbid >> 32) & 0xFFFFFFFF)    # 0x74 persistent id
-    _pad(header, MHIT_HDR)
+    # We build the header by writing into a pre-zeroed buffer at explicit
+    # offsets, which is clearer than appending field-by-field and easier
+    # to audit against the format spec.
+    hdr = bytearray(MHIT_HDR)
+    hdr[0x00:0x04] = b"mhit"
+    struct.pack_into("<I", hdr, 0x04, MHIT_HDR)
+    struct.pack_into("<I", hdr, 0x08, total_len)
+    struct.pack_into("<I", hdr, 0x0C, n_children)         # num_strings
+    struct.pack_into("<I", hdr, 0x10, track.track_id)
+    struct.pack_into("<I", hdr, 0x14, 1)                   # visible
+    hdr[0x18:0x1C] = _file_type_magic(track.file_ext)
+    hdr[0x1C] = 0                                           # type (0 = audio)
+    hdr[0x1D] = 0                                           # compilation
+    hdr[0x1E] = 0                                           # rating
+    hdr[0x1F] = 0                                           # (unused)
+    struct.pack_into("<I", hdr, 0x20, added_mac)           # last_modified
+    struct.pack_into("<I", hdr, 0x24, track.file_size)
+    struct.pack_into("<I", hdr, 0x28, track.length_ms)
+    struct.pack_into("<I", hdr, 0x2C, track.track_number)
+    struct.pack_into("<I", hdr, 0x30, track.track_count)
+    struct.pack_into("<I", hdr, 0x34, track.year)
+    struct.pack_into("<I", hdr, 0x38, track.bitrate_kbps)
+    struct.pack_into("<HH", hdr, 0x3C, 0, track.sample_rate_hz)
+    struct.pack_into("<I", hdr, 0x40, 0)                   # volume adjust
+    struct.pack_into("<I", hdr, 0x44, 0)                   # start_time
+    struct.pack_into("<I", hdr, 0x48, 0)                   # stop_time
+    struct.pack_into("<I", hdr, 0x4C, 0)                   # soundcheck
+    struct.pack_into("<I", hdr, 0x50, track.play_count)
+    struct.pack_into("<I", hdr, 0x54, track.play_count)
+    struct.pack_into("<I", hdr, 0x58, 0)                   # last_played_time
+    struct.pack_into("<I", hdr, 0x5C, track.disc_number)
+    struct.pack_into("<I", hdr, 0x60, track.disc_count)
+    struct.pack_into("<I", hdr, 0x64, 0)                   # user_id
+    struct.pack_into("<I", hdr, 0x68, added_mac)           # date_added
+    struct.pack_into("<I", hdr, 0x6C, 0)                   # bookmark_time
+    struct.pack_into("<Q", hdr, 0x70, track.dbid)          # persistent_id (64-bit)
+    # 0x78 .. 0xf3 are left zero (checked_flag, bpm, artwork_count, ...)
 
-    return bytes(header) + bytes(mhods)
+    return bytes(hdr) + bytes(mhods)
 
 
 def _build_mhip(track_id: int, playlist_item_id: int) -> bytes:

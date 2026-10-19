@@ -107,6 +107,26 @@ Yes, the whole thing is pure Python. The only platform-specific piece is `rename
 **Why no iPod Touch / iPhone support?**
 Those devices use the iOS sync protocol (`libimobiledevice`), which has nothing to do with the `iTunesDB` format. Different project entirely.
 
+## Troubleshooting
+
+**macOS: "macOS 26 (2601) or later required" when launching the GUI.**
+Your Python was linked against an old Tcl/Tk. Install a Python version with modern Tk:
+```bash
+brew install python@3.11 python-tk@3.11
+python3.11 -m venv .venv
+./.venv/bin/pip install git+https://github.com/manuelrocha88/iPodManager.git
+./.venv/bin/ipodmanager
+```
+
+**No iPod detected.**
+Make sure the iPod is in **disk mode** and mounts as a drive (you should see it in Finder / Explorer). First-generation Nano and Mini mount automatically; some older firmwares need you to force disk mode by holding **Menu + Play/Pause** at boot.
+
+**"Could not rename volume" on Linux.**
+FAT32 label changes on Linux need the iPod unmounted and `mlabel` from the `mtools` package: `sudo mlabel -i /dev/sdX1 ::NEWNAME`.
+
+**My iPod shows the songs but won't play them.**
+Double-check that the iPod isn't in "WPD/MTP" mode (Windows) — it needs to appear as a plain USB mass-storage drive. Also make sure the audio format is one the iPod supports: MP3, AAC/M4A, WAV, or AIFF. Lossless/ALAC and FLAC are not supported on the Mini/Nano 1G.
+
 ## Development
 
 ```bash
