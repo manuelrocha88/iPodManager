@@ -137,10 +137,21 @@ def to_itunes_path(pod: IPod, dest: Path) -> str:
 def copy_track_to_ipod(pod: IPod, source: Path) -> Path:
     """Copy a track into the iPod's Music folder tree and return the
     chosen destination path. Does NOT touch the iTunesDB — the library
-    layer handles that so the two always move together on sync."""
+    layer handles that so the two always move together on sync.
+
+    On macOS, writing to a FAT32 volume normally creates an AppleDouble
+    sidecar (``._foo.mp3``) that stores extended attributes the iPod
+    can't read. We copy with ``shutil.copyfile`` (data only) + a manual
+    mtime restore to keep the iPod clean.
+    """
     ensure_structure(pod)
     dest = assign_destination(pod, source)
-    shutil.copy2(source, dest)
+    shutil.copyfile(source, dest)
+    try:
+        src_stat = source.stat()
+        os.utime(dest, (src_stat.st_atime, src_stat.st_mtime))
+    except OSError:
+        pass
     return dest
 
 
@@ -222,3 +233,22 @@ def eject(pod: IPod) -> None:
         raise RuntimeError("On Windows, right-click the iPod drive and choose Eject.")
     else:
         subprocess.run(["umount", str(pod.mountpoint)], check=True)
+
+
+def clean_macos_metadata(pod: IPod) -> None:
+    """Flatten/remove the ``._*`` AppleDouble sidecars macOS writes on FAT32.
+
+    The iPod firmware is confused by these — they can show up as phantom
+    tracks or make folders look bigger than they are. ``dot_clean`` is a
+    built-in utility that writes the metadata back into the real file's
+    extended attributes (where supported) and removes the sidecar.
+    """
+    if platform.system() != "Darwin":
+        return
+    try:
+        subprocess.run(
+            ["dot_clean", "-m", str(pod.mountpoint)],
+            check=False, capture_output=True, timeout=30,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        pass

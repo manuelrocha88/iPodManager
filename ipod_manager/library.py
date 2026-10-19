@@ -25,8 +25,8 @@ from typing import Dict, List, Optional
 import mutagen
 
 from . import itunesdb
-from .device import (IPod, copy_track_to_ipod, ensure_structure,
-                     remove_track_from_ipod, to_itunes_path)
+from .device import (IPod, clean_macos_metadata, copy_track_to_ipod,
+                     ensure_structure, remove_track_from_ipod, to_itunes_path)
 
 
 # Default name the master playlist carries if the user hasn't set one.
@@ -247,6 +247,7 @@ class Library:
             library_persistent_id=self._library_pid,
         )
         self.save_sidecar()
+        clean_macos_metadata(self.pod)
 
     @staticmethod
     def _to_itunesdb_track(e: LibraryEntry) -> itunesdb.Track:
