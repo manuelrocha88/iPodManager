@@ -257,6 +257,25 @@ class Library:
                 return True
         return False
 
+    def prune_missing(self) -> List[LibraryEntry]:
+        """Drop sidecar entries whose audio file no longer exists on the iPod.
+
+        This recovers from the iPod wiping the Music folder (which can
+        happen when the device firmware rejects a corrupt iTunesDB).
+        Returns the list of pruned entries.
+        """
+        import os
+        kept: List[LibraryEntry] = []
+        pruned: List[LibraryEntry] = []
+        for e in self.entries:
+            rel = e.ipod_path.lstrip(":").replace(":", os.sep)
+            if (self.pod.mountpoint / rel).is_file():
+                kept.append(e)
+            else:
+                pruned.append(e)
+        self.entries = kept
+        return pruned
+
     def rename(self, new_name: str) -> None:
         """Change the master-playlist name shown on the iPod."""
         self.ipod_name = new_name.strip() or DEFAULT_IPOD_NAME

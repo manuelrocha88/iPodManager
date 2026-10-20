@@ -163,6 +163,20 @@ def cmd_sync(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_prune(args: argparse.Namespace) -> int:
+    pod = _resolve_pod(args.mount)
+    lib = Library.load(pod)
+    pruned = lib.prune_missing()
+    if not pruned:
+        print("No ghost entries — library is clean.")
+        return 0
+    for e in pruned:
+        print(f"  - pruned [{e.track_id}] {e.title}  ({e.ipod_path})")
+    lib.sync()
+    print(f"Pruned {len(pruned)} missing track(s) and rewrote iTunesDB.")
+    return 0
+
+
 def cmd_eject(args: argparse.Namespace) -> int:
     pod = _resolve_pod(args.mount)
     eject(pod)
@@ -206,6 +220,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_rename)
 
     sub.add_parser("sync", help="Rewrite iTunesDB from the sidecar").set_defaults(func=cmd_sync)
+    sub.add_parser("prune", help="Drop sidecar entries whose files are missing").set_defaults(func=cmd_prune)
     sub.add_parser("eject", help="Flush writes and safely unmount").set_defaults(func=cmd_eject)
 
     return p
