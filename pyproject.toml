@@ -50,4 +50,4 @@ Issues = "https://github.com/manuelrocha88/iPodManager/issues"
 include = ["ipod_manager*"]
 
 [tool.setuptools.package-data]
-"ipod_manager" = ["gui/assets/*"]
+"ipod_manager" = ["gui/assets/*", "templates/*.bin"]

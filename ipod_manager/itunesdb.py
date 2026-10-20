@@ -9,30 +9,29 @@ Chunk reference (abbreviated):
 
   mhbd  database header         — root
   mhsd  dataset header          — one per section (tracks, playlists, ...)
-  mhlt  track list header       — contains N mhit
+  mhlt  track list header       — contains N mhit (as siblings in parent mhsd)
   mhit  track item              — contains M mhod (strings)
   mhod  data object             — string / location / playlist index
-  mhlp  playlist list header    — contains N mhyp
+  mhlp  playlist list header    — contains N mhyp (as siblings in parent mhsd)
   mhyp  playlist                — contains M mhip + mhod children
   mhip  playlist item           — references a track by id
 
-We generate a minimal but valid DB with:
-    mhbd
-      mhsd(type=1, tracks)
-        mhlt (N tracks)
-          mhit + 2-3 mhods each (location, title, [artist, album])
-      mhsd(type=2, playlists v1)
-        mhlp (1 playlist)
-          mhyp "<ipod name>" master playlist
-            mhods (name, "sort by title" index)
-            mhip x N (one per track)
-      mhsd(type=3, playlists v2)
-        mhlp (1 playlist)
-          mhyp "<ipod name>" master playlist   # duplicate, newer iPods expect it
+Writing strategy
+================
 
-The empty DB that ships blank on a Nano 1G has a few extra mhsd sections
-(albums, podcast playlist, etc.). Those are optional and iPods happily
-ignore their absence as long as the master playlist exists.
+Early versions of this module built the entire DB from scratch. That
+turned out to be too fragile — the iPod firmware is picky about which
+mhsd sections exist, several poorly-documented bytes in the mhbd
+header, and a bunch of unused but required mhods on the master
+playlist (sort indices). An empty DB written by iTunes contains all of
+those as "magic bytes" we don't need to understand.
+
+So the production path (:func:`build_itunesdb`) now does
+*template splicing*: it loads the empty iTunesDB that shipped on the
+iPod, parses its chunk tree, inserts our mhits into the track list and
+our mhips into every master playlist, re-counts and resizes the parent
+containers, and writes it back. Only the specific bytes we care about
+change; everything else is preserved exactly as iTunes wrote it.
 """
 
 from __future__ import annotations
@@ -375,48 +374,209 @@ def _build_mhbd(datasets: List[bytes], library_persistent_id: int) -> bytes:
 
 
 # ------------------------------------------------------------------ #
-# High-level entry point                                              #
+# Template parser + splicer                                           #
+# ------------------------------------------------------------------ #
+#
+# When the iPod ships (or after an iTunes "Restore"), it has an empty
+# iTunesDB whose header carries a bunch of poorly-documented bytes the
+# firmware checks before trusting the file. We keep those bytes intact
+# by using that empty DB as a template and splicing in only the chunks
+# we actually produce: the mhits (into the track mhlt) and the mhips
+# (into every master mhyp). Every container's total_length and child
+# count is re-counted on write.
+
+# Chunk-type categories used by the parser.
+# "Containers with total_length": header gives header_length AND the
+#   total length of the chunk including its children. Children live
+#   directly inside the chunk (within `total_length`).
+# "List headers (count only)": header_length only; children are the
+#   next siblings in the enclosing container's body, and the count is
+#   stored at offset +0x08.
+_CONTAINERS = {b"mhbd", b"mhsd", b"mhyp", b"mhit", b"mhip"}
+_HAS_TOTAL_LEN = _CONTAINERS | {b"mhod"}
+# mhla is theoretically a container (album list), but iTunes emits it
+# with total_len = 0 in empty libraries, which would deadlock a naive
+# parser. We treat it like mhlt/mhlp — a header-only list sibling.
+_LIST_HEADER = {b"mhlt", b"mhlp", b"mhla"}
+
+
+def _parse_chunk(buf: bytes, offset: int, end: int) -> Optional[dict]:
+    """Parse one chunk starting at `offset`, bounded by `end` (parent limit).
+
+    Returns a dict with keys:
+      magic      : 4-byte identifier
+      header     : the fixed-size header bytes (0 .. hdr_len)
+      payload    : bytes between hdr_len and total_len that are NOT sub-chunks
+                   (e.g. an mhod's string data). Containers leave this empty
+                   and store their nested chunks under ``children``.
+      hdr_len    : length of the fixed header
+      total_len  : length of the whole chunk (header + payload + children)
+      children   : list of parsed sub-chunk dicts (containers only)
+    """
+    if offset + 8 > end:
+        return None
+    magic = bytes(buf[offset:offset + 4])
+    if not magic.isalpha():
+        return None
+    hdr_len = struct.unpack_from("<I", buf, offset + 4)[0]
+    if offset + hdr_len > end:
+        return None
+
+    if magic in _HAS_TOTAL_LEN:
+        total_len = struct.unpack_from("<I", buf, offset + 8)[0]
+    else:                                 # mhlt, mhlp, mhla: no total_len
+        total_len = hdr_len
+
+    chunk = {
+        "magic":    magic,
+        "header":   bytearray(buf[offset:offset + hdr_len]),
+        "payload":  b"",
+        "hdr_len":  hdr_len,
+        "total_len": total_len,
+        "children": [],
+    }
+
+    if magic in _CONTAINERS:
+        p = offset + hdr_len
+        cend = offset + total_len
+        while p < cend:
+            child = _parse_chunk(buf, p, cend)
+            if child is None:
+                break
+            chunk["children"].append(child)
+            step = child["total_len"] if child["total_len"] > 0 else child["hdr_len"]
+            p += step
+    elif total_len > hdr_len:
+        # Non-container with trailing data (an mhod's string block, etc.).
+        chunk["payload"] = bytes(buf[offset + hdr_len:offset + total_len])
+    return chunk
+
+
+def _serialize_chunk(chunk: dict, out: bytearray) -> None:
+    """Serialize a chunk subtree into `out`, recomputing sizes/counts."""
+    magic = chunk["magic"]
+    header = bytearray(chunk["header"])
+
+    if chunk["children"]:
+        # Container: fix up any list-header children (mhlt/mhlp/mhla)
+        # with the current count of their matching sibling type before
+        # serializing them.
+        n_mhit = sum(1 for c in chunk["children"] if c["magic"] == b"mhit")
+        n_mhyp = sum(1 for c in chunk["children"] if c["magic"] == b"mhyp")
+        for c in chunk["children"]:
+            if c["magic"] == b"mhlt":
+                struct.pack_into("<I", c["header"], 8, n_mhit)
+            elif c["magic"] == b"mhlp":
+                struct.pack_into("<I", c["header"], 8, n_mhyp)
+        body = bytearray()
+        for c in chunk["children"]:
+            _serialize_chunk(c, body)
+    else:
+        # Leaf chunk: payload is whatever came after the fixed header.
+        body = bytearray(chunk["payload"])
+
+    if magic in _HAS_TOTAL_LEN:
+        struct.pack_into("<I", header, 8, chunk["hdr_len"] + len(body))
+
+    out += bytes(header)
+    out += bytes(body)
+
+
+def _find_descendants(chunk: dict, magic: bytes) -> List[dict]:
+    """DFS collect every descendant with the given magic."""
+    out: List[dict] = []
+    for c in chunk["children"]:
+        if c["magic"] == magic:
+            out.append(c)
+        out.extend(_find_descendants(c, magic))
+    return out
+
+
+# ------------------------------------------------------------------ #
+# High-level entry points                                             #
 # ------------------------------------------------------------------ #
 
 
-def build_itunesdb(tracks: List[Track], ipod_name: str = "iPod",
-                   library_persistent_id: Optional[int] = None) -> bytes:
-    """Build and return a complete iTunesDB file as bytes.
+def build_itunesdb(template: bytes, tracks: List[Track],
+                   ipod_name: str = "iPod") -> bytes:
+    """Build an iTunesDB by splicing `tracks` into an empty-DB `template`.
 
-    `tracks` must have unique .track_id values (1-based). `ipod_name` is
-    the label of the master playlist, which is what the iPod displays as
-    the device name under Settings → About.
+    The template must be a valid iTunesDB produced by iTunes or the iPod
+    itself — the function reuses its mhbd header, every mhsd section it
+    contains, and the master playlist's sort-index mhods. We only insert
+    our mhits/mhips and update size/count fields.
+
+    If the template already has tracks in its mhlt or mhips in its master
+    playlists, they are preserved and ours are appended.
     """
-    if library_persistent_id is None:
-        library_persistent_id = int.from_bytes(os.urandom(8), "little")
+    root = _parse_chunk(template, 0, len(template))
+    if root is None or root["magic"] != b"mhbd":
+        raise ValueError("template is not a valid iTunesDB (no mhbd root)")
 
-    track_ids = [t.track_id for t in tracks]
+    # Find the track dataset (mhsd with type=1) and insert mhits as
+    # children of that mhsd. The mhlt header sibling already exists.
+    track_mhsds = [c for c in root["children"]
+                   if c["magic"] == b"mhsd"
+                   and struct.unpack_from("<I", c["header"], 12)[0] == MHSD_TRACKS]
+    if not track_mhsds:
+        raise ValueError("template has no track mhsd (type=1)")
+    track_mhsd = track_mhsds[0]
+    for t in tracks:
+        mhit_bytes = _build_mhit(t)
+        track_mhsd["children"].append(_parse_chunk(mhit_bytes, 0, len(mhit_bytes)))
 
-    # Dataset 1: tracks.
-    tracks_mhlt = _build_mhlt(tracks)
-    tracks_mhsd = _build_mhsd(MHSD_TRACKS, tracks_mhlt)
+    # Rename every master playlist to the chosen iPod name, and append
+    # one mhip per track. playlist_item_id is unique within each mhyp,
+    # we restart from (existing + 1).
+    for mhyp in _find_descendants(root, b"mhyp"):
+        is_master = struct.unpack_from("<I", mhyp["header"], 0x14)[0]
+        if not is_master:
+            continue
 
-    # Dataset 2: playlists (v1, older-style). Must include the master
-    # playlist. We emit a single master playlist here.
-    master_v1 = _build_mhyp(ipod_name, is_master=True, track_ids=track_ids)
-    playlists_v1 = _build_mhlp([master_v1], n_playlists=1)
-    playlists_v1_mhsd = _build_mhsd(MHSD_PLAYLISTS_V1, playlists_v1)
+        _rename_master_playlist(mhyp, ipod_name)
 
-    # Dataset 3: playlists (v2). Newer firmware reads this preferentially.
-    master_v2 = _build_mhyp(ipod_name, is_master=True, track_ids=track_ids)
-    playlists_v2 = _build_mhlp([master_v2], n_playlists=1)
-    playlists_v2_mhsd = _build_mhsd(MHSD_PLAYLISTS_V2, playlists_v2)
+        existing_mhips = sum(1 for c in mhyp["children"] if c["magic"] == b"mhip")
+        for idx, t in enumerate(tracks, start=existing_mhips + 1):
+            mhip_bytes = _build_mhip(t.track_id, playlist_item_id=idx)
+            mhyp["children"].append(_parse_chunk(mhip_bytes, 0, len(mhip_bytes)))
+        # mhyp.n_mhips at offset 0x10
+        n_mhips = sum(1 for c in mhyp["children"] if c["magic"] == b"mhip")
+        struct.pack_into("<I", mhyp["header"], 0x10, n_mhips)
 
-    return _build_mhbd(
-        [tracks_mhsd, playlists_v1_mhsd, playlists_v2_mhsd],
-        library_persistent_id,
-    )
+    out = bytearray()
+    _serialize_chunk(root, out)
+    return bytes(out)
+
+
+def _rename_master_playlist(mhyp: dict, new_name: str) -> None:
+    """Replace the playlist-name mhod inside a mhyp.
+
+    iTunes DBs use mhod type 1 for the playlist name on older iPods
+    (Nano 1G/2G, Mini, Video 5G), and type 101 on newer firmware. We
+    replace whichever one the template contains, preserving its type
+    so the rest of the mhyp still matches what the iPod expects.
+    """
+    for i, c in enumerate(mhyp["children"]):
+        if c["magic"] != b"mhod":
+            continue
+        mhod_type = struct.unpack_from("<I", c["header"], 12)[0]
+        if mhod_type in (MHOD_TITLE, MHOD_PLAYLIST_NAME):
+            new_bytes = _build_mhod_string(mhod_type, new_name)
+            mhyp["children"][i] = _parse_chunk(new_bytes, 0, len(new_bytes))
+            return
 
 
 def write_itunesdb(path: str, tracks: List[Track], ipod_name: str = "iPod",
-                   library_persistent_id: Optional[int] = None) -> None:
-    """Build and atomically write the iTunesDB to `path`."""
-    data = build_itunesdb(tracks, ipod_name, library_persistent_id)
+                   template: Optional[bytes] = None) -> None:
+    """Build and atomically write the iTunesDB to `path`.
+
+    `template` is the bytes of an empty iTunesDB that the iPod/iTunes
+    produced. Callers typically keep a copy next to the DB and reuse
+    it on every sync.
+    """
+    if template is None:
+        raise ValueError("write_itunesdb requires a template DB")
+    data = build_itunesdb(template, tracks, ipod_name)
     tmp = path + ".tmp"
     with open(tmp, "wb") as f:
         f.write(data)

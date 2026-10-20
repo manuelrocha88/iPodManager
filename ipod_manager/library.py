@@ -32,6 +32,12 @@ from .device import (IPod, clean_macos_metadata, copy_track_to_ipod,
 # Default name the master playlist carries if the user hasn't set one.
 DEFAULT_IPOD_NAME = "iPod"
 
+# Filename of the per-iPod template snapshot. The first time we see a
+# fresh iPod we copy its iTunes-written iTunesDB here, then reuse it
+# as the splice template on every sync. Keeping a per-iPod copy means
+# the mhbd persistent id and all the model-specific bytes stay intact.
+TEMPLATE_SNAPSHOT_NAME = "ipodmanager.template"
+
 
 # ------------------------------------------------------------------ #
 # Entry record                                                        #
@@ -145,6 +151,27 @@ def _read_tags(path: Path) -> Dict[str, object]:
 SIDECAR_VERSION = 1
 
 
+def _looks_like_empty_itunes_template(data: bytes) -> bool:
+    """True if `data` is a plausible untouched iTunes-written iTunesDB.
+
+    Specifically: starts with the mhbd magic, has a track-dataset mhsd
+    whose mhlt has zero mhits, and the file is small enough to not
+    contain any track data. We use this to detect when the iPod is in
+    a known-good state (either fresh from iTunes or just restored).
+    """
+    if len(data) < 32 or data[:4] != b"mhbd":
+        return False
+    # Hard upper bound: an empty DB produced by iTunes 7 is ~8-16KB.
+    if len(data) > 32_000:
+        return False
+    mhlt = data.find(b"mhlt")
+    if mhlt < 0:
+        return False
+    import struct as _s
+    n_tracks = _s.unpack_from("<I", data, mhlt + 8)[0]
+    return n_tracks == 0
+
+
 class Library:
     """Collection of LibraryEntry on a specific iPod, backed by a JSON sidecar."""
 
@@ -239,15 +266,49 @@ class Library:
     def sync(self) -> None:
         """Write the iTunesDB and sidecar to the iPod."""
         ensure_structure(self.pod)
+        template = self._load_or_snapshot_template()
         tracks = [self._to_itunesdb_track(e) for e in self.entries]
         itunesdb.write_itunesdb(
             str(self.pod.itunesdb_path),
             tracks,
             ipod_name=self.ipod_name,
-            library_persistent_id=self._library_pid,
+            template=template,
         )
         self.save_sidecar()
         clean_macos_metadata(self.pod)
+
+    def _load_or_snapshot_template(self) -> bytes:
+        """Return the empty-DB template bytes to splice into.
+
+        Precedence:
+          1. ``iPod_Control/iTunes/ipodmanager.template`` on the iPod
+             (snapshot of its original iTunesDB, if we ever captured one).
+          2. The current ``iTunesDB`` on the iPod if it looks like an
+             empty / untouched iTunes-produced database — if so, we
+             copy it to the snapshot location for next time.
+          3. The bundled generic Nano 1G template inside the package.
+        """
+        snapshot_path = self.pod.itunes_dir / TEMPLATE_SNAPSHOT_NAME
+
+        if snapshot_path.exists():
+            return snapshot_path.read_bytes()
+
+        current_db = self.pod.itunesdb_path
+        if current_db.exists():
+            data = current_db.read_bytes()
+            if _looks_like_empty_itunes_template(data):
+                snapshot_path.write_bytes(data)
+                return data
+
+        bundled = Path(__file__).parent / "templates" / "empty_nano1g.bin"
+        template = bundled.read_bytes()
+        # Cache a per-iPod copy so future runs don't depend on the
+        # bundled file layout and so Rename iPod stays stable.
+        try:
+            snapshot_path.write_bytes(template)
+        except OSError:
+            pass
+        return template
 
     @staticmethod
     def _to_itunesdb_track(e: LibraryEntry) -> itunesdb.Track:
