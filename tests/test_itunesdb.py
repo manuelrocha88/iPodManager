@@ -74,8 +74,11 @@ def test_single_track_splice(template: bytes):
     assert struct.unpack("<I", data[mhit + 0x24:mhit + 0x28])[0] == 4_500_000
     assert struct.unpack("<I", data[mhit + 0x28:mhit + 0x2C])[0] == 180_000
     assert struct.unpack("<I", data[mhit + 0x38:mhit + 0x3C])[0] == 192
-    assert struct.unpack("<I", data[mhit + 0x3C:mhit + 0x40])[0] == 44100
+    # Samplerate is Hz << 16 (fixed-point 16.16).
+    assert struct.unpack("<I", data[mhit + 0x3C:mhit + 0x40])[0] == 44100 << 16
     assert struct.unpack("<Q", data[mhit + 0x70:mhit + 0x78])[0] == 0x1122334455667788
+    # Media type at 0xD0 must be 1 (audio).
+    assert struct.unpack("<I", data[mhit + 0xD0:mhit + 0xD4])[0] == 1
 
     # Every master mhyp (template has several — podcasts/library in
     # both v1 and v2 playlist datasets) now contains an mhip pointing

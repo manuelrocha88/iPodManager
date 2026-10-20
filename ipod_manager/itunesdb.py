@@ -189,19 +189,33 @@ def _build_mhod_string(mhod_type: int, value: str) -> bytes:
     return bytes(buf)
 
 
-def _build_mhod_playlist_index() -> bytes:
-    """mhod subtype 100 — "sort order" index attached to the master playlist.
+def _build_mhod_playlist_index(position: int) -> bytes:
+    """mhod subtype 100 — playlist-item ordering slot, child of every mhip.
 
-    The payload is a 0x60-byte block that would normally hold a sorted
-    index of track positions; the iPod firmware regenerates it when it
-    first mounts the DB, so we emit an empty one.
+    Layout (44 bytes total, 24-byte header + 20-byte payload):
+      0x00  "mhod"
+      0x04  header_len (0x18)
+      0x08  total_len  (0x2C)
+      0x0C  type (100)
+      0x10  unknown (0)
+      0x14  unknown (0)
+      0x18  position (1-based ordinal in the playlist)
+      0x1C-0x2B  five uint32 zeroes (sort flags, firmware fills in)
+
+    Every mhip from iTunes 4.9 (mhbd version >= 0x0d) onward carries
+    exactly one of these. Omitting it, or giving it the wrong total
+    length, causes Nano-era firmware to drop the playlist and show
+    "0 Songs" even though the mhit chain is valid.
     """
-    header = bytearray()
-    header += b"mhod"
-    header += struct.pack("<III", MHOD_HDR, MHOD_HDR + 0x60, MHOD_PLAYLIST_INDEX)
-    header += struct.pack("<II", 0, 0)
-    header += b"\x00" * 0x60
-    return bytes(header)
+    total_len = 0x2C
+    buf = bytearray(total_len)
+    buf[0:4] = b"mhod"
+    struct.pack_into("<I", buf, 0x04, MHOD_HDR)
+    struct.pack_into("<I", buf, 0x08, total_len)
+    struct.pack_into("<I", buf, 0x0C, MHOD_PLAYLIST_INDEX)
+    # 0x10, 0x14 left 0
+    struct.pack_into("<I", buf, 0x18, position)
+    return bytes(buf)
 
 
 def _build_mhit(track: Track) -> bytes:
@@ -254,10 +268,12 @@ def _build_mhit(track: Track) -> bytes:
     struct.pack_into("<I", hdr, 0x10, track.track_id)
     struct.pack_into("<I", hdr, 0x14, 1)                   # visible
     hdr[0x18:0x1C] = _file_type_magic(track.file_ext)
-    hdr[0x1C] = 0                                           # type (0 = audio)
-    hdr[0x1D] = 0                                           # compilation
-    hdr[0x1E] = 0                                           # rating
-    hdr[0x1F] = 0                                           # (unused)
+    hdr[0x1C] = 0                                           # type1 (CBR flag)
+    # type2 byte at 0x1D: 1 for MP3, 0 for AAC. Nano 1G firmware uses
+    # this to pick a decoder; mislabelling it hides the track.
+    hdr[0x1D] = 1 if track.file_ext.lower() == "mp3" else 0
+    hdr[0x1E] = 0                                           # compilation
+    hdr[0x1F] = 0                                           # rating (0-100)
     struct.pack_into("<I", hdr, 0x20, added_mac)           # last_modified
     struct.pack_into("<I", hdr, 0x24, track.file_size)
     struct.pack_into("<I", hdr, 0x28, length_ms)
@@ -265,8 +281,10 @@ def _build_mhit(track: Track) -> bytes:
     struct.pack_into("<I", hdr, 0x30, track.track_count)
     struct.pack_into("<I", hdr, 0x34, track.year)
     struct.pack_into("<I", hdr, 0x38, track.bitrate_kbps)
-    # Sample rate is a plain 32-bit LE int, NOT two 16-bit halves.
-    struct.pack_into("<I", hdr, 0x3C, track.sample_rate_hz)
+    # Sample rate at 0x3C is stored as Hz << 16 (fixed-point 16.16),
+    # NOT raw Hz. Writing 44100 instead of 44100 << 16 makes the iPod
+    # treat the file as unplayable and show "0 songs".
+    struct.pack_into("<I", hdr, 0x3C, track.sample_rate_hz << 16)
     struct.pack_into("<I", hdr, 0x40, 0)                   # volume adjust
     struct.pack_into("<I", hdr, 0x44, 0)                   # start_time
     struct.pack_into("<I", hdr, 0x48, 0)                   # stop_time
@@ -280,6 +298,10 @@ def _build_mhit(track: Track) -> bytes:
     struct.pack_into("<I", hdr, 0x68, added_mac)           # date_added
     struct.pack_into("<I", hdr, 0x6C, 0)                   # bookmark_time
     struct.pack_into("<Q", hdr, 0x70, track.dbid)          # persistent_id (64-bit)
+    # Media Type at 0xD0 must be 1 for audio. Firmware since Nano 1G
+    # cross-checks this before including the track in Songs — leaving
+    # it zero is what makes the device display "0 Songs".
+    struct.pack_into("<I", hdr, 0xD0, 1)                   # media_type = audio
     # 0x78 .. 0xf3 are left zero (checked_flag, bpm, artwork_count, ...)
 
     return bytes(hdr) + bytes(mhods)
@@ -288,21 +310,23 @@ def _build_mhit(track: Track) -> bytes:
 def _build_mhip(track_id: int, playlist_item_id: int) -> bytes:
     """mhip = playlist item.  Links a playlist (mhyp) to a specific track id.
 
-    Nano 1G–era firmware does NOT want child mhods on mhip. The sort
-    indices live on the master mhyp itself. Adding a child here causes
-    the device to reject the playlist. We emit just the fixed header.
+    From iTunes 4.9 onward every mhip carries exactly one child mhod of
+    type 100 holding the ordinal position of this item in its playlist.
     """
+    sort_mhod = _build_mhod_playlist_index(playlist_item_id)
+    total_len = MHIP_HDR + len(sort_mhod)
+
     header = bytearray(MHIP_HDR)
     header[0:4] = b"mhip"
     struct.pack_into("<I", header, 4, MHIP_HDR)
-    struct.pack_into("<I", header, 8, MHIP_HDR)       # total_len == hdr_len
-    struct.pack_into("<I", header, 0x0C, 0)            # num_mhods
+    struct.pack_into("<I", header, 8, total_len)
+    struct.pack_into("<I", header, 0x0C, 1)             # num_mhods = 1
     struct.pack_into("<I", header, 0x10, playlist_item_id)
-    struct.pack_into("<I", header, 0x14, 0)            # unknown
-    struct.pack_into("<I", header, 0x18, 0)            # group id
+    struct.pack_into("<I", header, 0x14, 0)             # unknown
+    struct.pack_into("<I", header, 0x18, 0)             # group id
     struct.pack_into("<I", header, 0x1C, track_id)
-    struct.pack_into("<I", header, 0x20, 0)            # timestamp
-    return bytes(header)
+    struct.pack_into("<I", header, 0x20, 0)             # timestamp
+    return bytes(header) + sort_mhod
 
 
 def _build_mhyp(name: str, is_master: bool, track_ids: List[int]) -> bytes:
