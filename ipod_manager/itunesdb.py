@@ -53,7 +53,11 @@ MHLT_HDR = 0x5C
 MHLP_HDR = 0x5C
 MHYP_HDR = 0xB8
 MHIP_HDR = 0x4C
-MHIT_HDR = 0xF4
+# mhit header is 0x248 bytes on iTunes DB version >= 0x13 (iTunes 7+),
+# which includes every modern Nano 1G sync. Older DBs used 0x9C or
+# 0xF4 but modern firmware expects the full 0x248 with media type at
+# 0xD0, dbid2 at 0xA8, etc. Mirrors libgpod's `mk_mhit`.
+MHIT_HDR = 0x248
 MHOD_HDR = 0x18  # fixed header before string payload inside mhod
 
 # mhod payload types (what the string/location block represents).
@@ -221,15 +225,12 @@ def _build_mhod_playlist_index(position: int) -> bytes:
 def _build_mhit(track: Track) -> bytes:
     """Build one mhit + its mhod children.
 
-    Field layout follows the documented ipodlinux "mhit v1" structure
-    (header length 0xf4). The important fields for playback are the id,
-    the visible flag, the filetype magic, and the location mhod child —
-    everything else is display metadata. We populate it anyway so the
-    iPod shows accurate duration/bitrate/etc. in its UI.
-
-    iTunes writes the Location mhod first, before Title/Artist/Album,
-    and the iPod walks the children in order looking for Location.
-    Mirroring that order avoids tripping older firmware.
+    Byte-for-byte port of libgpod's ``mk_mhit`` (``src/itdb_itunesdb.c``).
+    The header is a fixed 0x248 bytes with ~60 fields; most are zero
+    for a straightforward audio track but a handful (``media_type`` at
+    0xD0, ``dbid2`` at 0xA8, the big block of mid-header unknowns like
+    the 0x808080808080LL marker at 0x134) are checked by current
+    firmware. Writing them produces a DB that Nano 1G accepts.
     """
     mhods = bytearray()
     mhods += _build_mhod_string(MHOD_LOCATION, track.ipod_path)
@@ -249,60 +250,88 @@ def _build_mhit(track: Track) -> bytes:
     total_len = MHIT_HDR + len(mhods)
     added_mac = track.date_added or unix_to_mac_time()
 
-    # If length is unknown (common for YouTube-sourced MP3s where mutagen
-    # can't read a VBR Xing header), estimate it from file size and
-    # bitrate. iPods will refuse to list tracks whose reported length is
-    # zero, so this is load-bearing.
     length_ms = track.length_ms
     if length_ms == 0 and track.file_size and track.bitrate_kbps:
         length_ms = int(track.file_size * 8 / (track.bitrate_kbps * 1000) * 1000)
 
-    # We build the header by writing into a pre-zeroed buffer at explicit
-    # offsets, which is clearer than appending field-by-field and easier
-    # to audit against the format spec.
     hdr = bytearray(MHIT_HDR)
     hdr[0x00:0x04] = b"mhit"
     struct.pack_into("<I", hdr, 0x04, MHIT_HDR)
     struct.pack_into("<I", hdr, 0x08, total_len)
-    struct.pack_into("<I", hdr, 0x0C, n_children)         # num_strings
+    struct.pack_into("<I", hdr, 0x0C, n_children)
+
+    # +0x10
     struct.pack_into("<I", hdr, 0x10, track.track_id)
-    struct.pack_into("<I", hdr, 0x14, 1)                   # visible
+    struct.pack_into("<I", hdr, 0x14, 1)                      # visible
     hdr[0x18:0x1C] = _file_type_magic(track.file_ext)
-    hdr[0x1C] = 0                                           # type1 (CBR flag)
-    # type2 byte at 0x1D: 1 for MP3, 0 for AAC. Nano 1G firmware uses
-    # this to pick a decoder; mislabelling it hides the track.
-    hdr[0x1D] = 1 if track.file_ext.lower() == "mp3" else 0
-    hdr[0x1E] = 0                                           # compilation
-    hdr[0x1F] = 0                                           # rating (0-100)
-    struct.pack_into("<I", hdr, 0x20, added_mac)           # last_modified
+    hdr[0x1C] = 0                                              # type1
+    hdr[0x1D] = 1 if track.file_ext.lower() == "mp3" else 0    # type2
+    hdr[0x1E] = 0                                              # compilation
+    hdr[0x1F] = 0                                              # rating
+
+    # +0x20
+    struct.pack_into("<I", hdr, 0x20, added_mac)              # time_modified
     struct.pack_into("<I", hdr, 0x24, track.file_size)
     struct.pack_into("<I", hdr, 0x28, length_ms)
     struct.pack_into("<I", hdr, 0x2C, track.track_number)
+
+    # +0x30
     struct.pack_into("<I", hdr, 0x30, track.track_count)
     struct.pack_into("<I", hdr, 0x34, track.year)
     struct.pack_into("<I", hdr, 0x38, track.bitrate_kbps)
-    # Sample rate at 0x3C is stored as Hz << 16 (fixed-point 16.16),
-    # NOT raw Hz. Writing 44100 instead of 44100 << 16 makes the iPod
-    # treat the file as unplayable and show "0 songs".
     struct.pack_into("<I", hdr, 0x3C, track.sample_rate_hz << 16)
-    struct.pack_into("<I", hdr, 0x40, 0)                   # volume adjust
-    struct.pack_into("<I", hdr, 0x44, 0)                   # start_time
-    struct.pack_into("<I", hdr, 0x48, 0)                   # stop_time
-    struct.pack_into("<I", hdr, 0x4C, 0)                   # soundcheck
+
+    # +0x40
+    struct.pack_into("<I", hdr, 0x40, 0)                      # volume
+    struct.pack_into("<I", hdr, 0x44, 0)                      # start_time
+    struct.pack_into("<I", hdr, 0x48, 0)                      # stop_time
+    struct.pack_into("<I", hdr, 0x4C, 0)                      # soundcheck
+
+    # +0x50
     struct.pack_into("<I", hdr, 0x50, track.play_count)
     struct.pack_into("<I", hdr, 0x54, track.play_count)
-    struct.pack_into("<I", hdr, 0x58, 0)                   # last_played_time
+    struct.pack_into("<I", hdr, 0x58, 0)                      # last_played
     struct.pack_into("<I", hdr, 0x5C, track.disc_number)
+
+    # +0x60
     struct.pack_into("<I", hdr, 0x60, track.disc_count)
-    struct.pack_into("<I", hdr, 0x64, 0)                   # user_id
-    struct.pack_into("<I", hdr, 0x68, added_mac)           # date_added
-    struct.pack_into("<I", hdr, 0x6C, 0)                   # bookmark_time
-    struct.pack_into("<Q", hdr, 0x70, track.dbid)          # persistent_id (64-bit)
-    # Media Type at 0xD0 must be 1 for audio. Firmware since Nano 1G
-    # cross-checks this before including the track in Songs — leaving
-    # it zero is what makes the device display "0 Songs".
-    struct.pack_into("<I", hdr, 0xD0, 1)                   # media_type = audio
-    # 0x78 .. 0xf3 are left zero (checked_flag, bpm, artwork_count, ...)
+    struct.pack_into("<I", hdr, 0x64, 0)                      # drm_userid
+    struct.pack_into("<I", hdr, 0x68, added_mac)              # time_added
+    struct.pack_into("<I", hdr, 0x6C, 0)                      # bookmark_time
+
+    # +0x70
+    struct.pack_into("<Q", hdr, 0x70, track.dbid)
+    hdr[0x78] = 0                                              # checked (0=visible)
+    hdr[0x79] = 0                                              # app_rating
+    struct.pack_into("<H", hdr, 0x7A, 0)                      # BPM
+    struct.pack_into("<H", hdr, 0x7C, 0)                      # artwork_count
+    struct.pack_into("<H", hdr, 0x7E, 0)                      # unk126
+
+    # +0x80
+    struct.pack_into("<I", hdr, 0x80, 0)                      # artwork_size
+    struct.pack_into("<I", hdr, 0x84, 0)                      # unk132
+    # samplerate2 as float32 (libgpod `put32lfloat`).
+    struct.pack_into("<f", hdr, 0x88, float(track.sample_rate_hz))
+    struct.pack_into("<I", hdr, 0x8C, 0)                      # time_released
+
+    # +0x90, +0x9C
+    struct.pack_into("<I", hdr, 0x94, 0)                      # unk148
+    struct.pack_into("<I", hdr, 0x98, 0)                      # unk152
+    struct.pack_into("<I", hdr, 0x9C, 0)                      # skipcount
+
+    # +0xA0
+    struct.pack_into("<I", hdr, 0xA0, 0)                      # last_skipped
+    hdr[0xA4] = 0                                              # has_artwork
+    hdr[0xA5] = 0                                              # skip_when_shuffling
+    hdr[0xA6] = 0                                              # remember_playback_position
+    hdr[0xA7] = 0                                              # flag4
+    struct.pack_into("<Q", hdr, 0xA8, track.dbid)             # dbid2 (same as dbid)
+
+    # +0xD0
+    struct.pack_into("<I", hdr, 0xD0, 1)                      # media_type = audio
+
+    # +0x134: libgpod writes 0x808080808080LL here, "what the heck is this?!"
+    struct.pack_into("<Q", hdr, 0x134, 0x808080808080)
 
     return bytes(hdr) + bytes(mhods)
 
