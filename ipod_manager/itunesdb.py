@@ -212,10 +212,14 @@ def _build_mhit(track: Track) -> bytes:
     the visible flag, the filetype magic, and the location mhod child —
     everything else is display metadata. We populate it anyway so the
     iPod shows accurate duration/bitrate/etc. in its UI.
+
+    iTunes writes the Location mhod first, before Title/Artist/Album,
+    and the iPod walks the children in order looking for Location.
+    Mirroring that order avoids tripping older firmware.
     """
     mhods = bytearray()
-    mhods += _build_mhod_string(MHOD_TITLE, track.title or "Untitled")
     mhods += _build_mhod_string(MHOD_LOCATION, track.ipod_path)
+    mhods += _build_mhod_string(MHOD_TITLE, track.title or "Untitled")
     if track.album:
         mhods += _build_mhod_string(MHOD_ALBUM, track.album)
     if track.artist:
@@ -230,6 +234,14 @@ def _build_mhit(track: Track) -> bytes:
 
     total_len = MHIT_HDR + len(mhods)
     added_mac = track.date_added or unix_to_mac_time()
+
+    # If length is unknown (common for YouTube-sourced MP3s where mutagen
+    # can't read a VBR Xing header), estimate it from file size and
+    # bitrate. iPods will refuse to list tracks whose reported length is
+    # zero, so this is load-bearing.
+    length_ms = track.length_ms
+    if length_ms == 0 and track.file_size and track.bitrate_kbps:
+        length_ms = int(track.file_size * 8 / (track.bitrate_kbps * 1000) * 1000)
 
     # We build the header by writing into a pre-zeroed buffer at explicit
     # offsets, which is clearer than appending field-by-field and easier
@@ -248,12 +260,13 @@ def _build_mhit(track: Track) -> bytes:
     hdr[0x1F] = 0                                           # (unused)
     struct.pack_into("<I", hdr, 0x20, added_mac)           # last_modified
     struct.pack_into("<I", hdr, 0x24, track.file_size)
-    struct.pack_into("<I", hdr, 0x28, track.length_ms)
+    struct.pack_into("<I", hdr, 0x28, length_ms)
     struct.pack_into("<I", hdr, 0x2C, track.track_number)
     struct.pack_into("<I", hdr, 0x30, track.track_count)
     struct.pack_into("<I", hdr, 0x34, track.year)
     struct.pack_into("<I", hdr, 0x38, track.bitrate_kbps)
-    struct.pack_into("<HH", hdr, 0x3C, 0, track.sample_rate_hz)
+    # Sample rate is a plain 32-bit LE int, NOT two 16-bit halves.
+    struct.pack_into("<I", hdr, 0x3C, track.sample_rate_hz)
     struct.pack_into("<I", hdr, 0x40, 0)                   # volume adjust
     struct.pack_into("<I", hdr, 0x44, 0)                   # start_time
     struct.pack_into("<I", hdr, 0x48, 0)                   # stop_time
@@ -275,23 +288,21 @@ def _build_mhit(track: Track) -> bytes:
 def _build_mhip(track_id: int, playlist_item_id: int) -> bytes:
     """mhip = playlist item.  Links a playlist (mhyp) to a specific track id.
 
-    The mhip has one mhod child of subtype 100 (empty "sort index" block)
-    for every playlist item on recent firmware. On older iPods it is
-    optional but harmless to emit.
+    Nano 1G–era firmware does NOT want child mhods on mhip. The sort
+    indices live on the master mhyp itself. Adding a child here causes
+    the device to reject the playlist. We emit just the fixed header.
     """
-    sort_mhod = _build_mhod_playlist_index()
-    total_len = MHIP_HDR + len(sort_mhod)
-
-    header = bytearray()
-    header += b"mhip"
-    header += struct.pack("<III", MHIP_HDR, total_len, 1)
-    header += struct.pack("<I", playlist_item_id)   # 0x10 playlist item id
-    header += struct.pack("<I", 0)                   # 0x14 unknown
-    header += struct.pack("<I", 0)                   # 0x18 group id
-    header += struct.pack("<I", track_id)            # 0x1c track id
-    header += struct.pack("<I", 0)                   # 0x20 timestamp
-    _pad(header, MHIP_HDR)
-    return bytes(header) + sort_mhod
+    header = bytearray(MHIP_HDR)
+    header[0:4] = b"mhip"
+    struct.pack_into("<I", header, 4, MHIP_HDR)
+    struct.pack_into("<I", header, 8, MHIP_HDR)       # total_len == hdr_len
+    struct.pack_into("<I", header, 0x0C, 0)            # num_mhods
+    struct.pack_into("<I", header, 0x10, playlist_item_id)
+    struct.pack_into("<I", header, 0x14, 0)            # unknown
+    struct.pack_into("<I", header, 0x18, 0)            # group id
+    struct.pack_into("<I", header, 0x1C, track_id)
+    struct.pack_into("<I", header, 0x20, 0)            # timestamp
+    return bytes(header)
 
 
 def _build_mhyp(name: str, is_master: bool, track_ids: List[int]) -> bytes:

@@ -102,6 +102,18 @@ def _read_tags(path: Path) -> Dict[str, object]:
         bitrate_kbps = int(getattr(info, "bitrate", 0) // 1000) or 128
         sample_rate_hz = int(getattr(info, "sample_rate", 44100))
 
+    # Fallback for VBR / stripped-header MP3s where mutagen reports
+    # length=0: estimate from file size and bitrate. The iPod refuses
+    # to list a track whose declared length is zero, so this matters.
+    if length_ms == 0 and bitrate_kbps:
+        try:
+            size = path.stat().st_size
+            length_ms = int(size * 8 / (bitrate_kbps * 1000) * 1000)
+        except OSError:
+            pass
+    if bitrate_kbps == 0:
+        bitrate_kbps = 128
+
     def parse_int(s: str) -> int:
         if not s:
             return 0
@@ -285,6 +297,7 @@ class Library:
     def sync(self) -> None:
         """Write the iTunesDB and sidecar to the iPod."""
         ensure_structure(self.pod)
+        self._backfill_missing_length()
         template = self._load_or_snapshot_template()
         tracks = [self._to_itunesdb_track(e) for e in self.entries]
         itunesdb.write_itunesdb(
@@ -295,6 +308,12 @@ class Library:
         )
         self.save_sidecar()
         clean_macos_metadata(self.pod)
+
+    def _backfill_missing_length(self) -> None:
+        """Replace length_ms=0 with a bitrate-based estimate on each entry."""
+        for e in self.entries:
+            if e.length_ms == 0 and e.file_size and e.bitrate_kbps:
+                e.length_ms = int(e.file_size * 8 / (e.bitrate_kbps * 1000) * 1000)
 
     def _load_or_snapshot_template(self) -> bytes:
         """Return the empty-DB template bytes to splice into.

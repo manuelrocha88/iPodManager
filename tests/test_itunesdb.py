@@ -74,7 +74,7 @@ def test_single_track_splice(template: bytes):
     assert struct.unpack("<I", data[mhit + 0x24:mhit + 0x28])[0] == 4_500_000
     assert struct.unpack("<I", data[mhit + 0x28:mhit + 0x2C])[0] == 180_000
     assert struct.unpack("<I", data[mhit + 0x38:mhit + 0x3C])[0] == 192
-    assert struct.unpack("<H", data[mhit + 0x3E:mhit + 0x40])[0] == 44100
+    assert struct.unpack("<I", data[mhit + 0x3C:mhit + 0x40])[0] == 44100
     assert struct.unpack("<Q", data[mhit + 0x70:mhit + 0x78])[0] == 0x1122334455667788
 
     # Every master mhyp (template has several — podcasts/library in
