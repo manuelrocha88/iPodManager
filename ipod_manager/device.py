@@ -235,6 +235,39 @@ def eject(pod: IPod) -> None:
         subprocess.run(["umount", str(pod.mountpoint)], check=True)
 
 
+def ensure_sysinfo(pod: IPod, model: str = "xA1137") -> None:
+    """Write a minimal ``iPod_Control/Device/SysInfo`` if it is missing or empty.
+
+    The iPod firmware reads this file to identify its own model and
+    FirewireGUID before parsing the iTunesDB. When it is empty — which
+    can happen on restored/misconfigured units — some firmware
+    revisions fall back to "safe mode" and refuse to list any tracks
+    even if the DB is otherwise valid.
+
+    The content below is the layout the Nano 1G 2GB (A1137) ships with
+    from the factory. FirewireGUID is left all-zero: Nano 1G does not
+    use the GUID-based mhbd hash, so a zero GUID is harmless.
+    """
+    sysinfo_path = pod.control_dir / "Device" / "SysInfo"
+    try:
+        if sysinfo_path.exists() and sysinfo_path.stat().st_size > 0:
+            return
+    except OSError:
+        pass
+    sysinfo_path.parent.mkdir(parents=True, exist_ok=True)
+    content = (
+        f"BuildID: 0x00000000 (00/00/00)\n"
+        f"VisibleBuildID: 1.3.1 (0001)\n"
+        f"ProductType: iPod\n"
+        f"pszSerialNumber: IPODMANAGER01\n"
+        f"ModelNumStr: {model}\n"
+        f"FirewireGuid: 0x0000000000000000\n"
+        f"PartNum: 820-1944-A\n"
+        f"boardHwName: PP5021C-B\n"
+    )
+    sysinfo_path.write_text(content, encoding="ascii")
+
+
 def clean_macos_metadata(pod: IPod) -> None:
     """Flatten/remove the ``._*`` AppleDouble sidecars macOS writes on FAT32.
 

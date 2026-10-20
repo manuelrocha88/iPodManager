@@ -26,7 +26,8 @@ import mutagen
 
 from . import itunesdb
 from .device import (IPod, clean_macos_metadata, copy_track_to_ipod,
-                     ensure_structure, remove_track_from_ipod, to_itunes_path)
+                     ensure_structure, ensure_sysinfo, remove_track_from_ipod,
+                     to_itunes_path)
 
 
 # Default name the master playlist carries if the user hasn't set one.
@@ -297,6 +298,7 @@ class Library:
     def sync(self) -> None:
         """Write the iTunesDB and sidecar to the iPod."""
         ensure_structure(self.pod)
+        ensure_sysinfo(self.pod)
         self._backfill_missing_length()
         template = self._load_or_snapshot_template()
         tracks = [self._to_itunesdb_track(e) for e in self.entries]
