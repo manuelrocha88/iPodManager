@@ -577,6 +577,14 @@ def build_itunesdb(template: bytes, tracks: List[Track],
     if root is None or root["magic"] != b"mhbd":
         raise ValueError("template is not a valid iTunesDB (no mhbd root)")
 
+    # Force the mhbd version to iTunes 7.4 (0x19). Some restored iPods
+    # have an anomalously high value (like 0x75) in the template which
+    # makes the firmware either expect a never-shipped layout or fall
+    # back to zero-track mode. 0x19 is the sweet spot documented in
+    # libgpod `mk_mhbd` as the "default modern format" and is what
+    # Nano 1G firmware was built for.
+    struct.pack_into("<I", root["header"], 0x10, ITUNESDB_VERSION)
+
     # Find the track dataset (mhsd with type=1) and insert mhits as
     # children of that mhsd. The mhlt header sibling already exists.
     track_mhsds = [c for c in root["children"]
